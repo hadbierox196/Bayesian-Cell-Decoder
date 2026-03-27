@@ -1,17 +1,15 @@
 """
-Assignment 1: Calcium Imaging Analysis
-Complete pipeline for calcium imaging data processing and analysis
+Assignment 2: Bayesian Place Cell Decoder
+Implementation of Bayesian and Population Vector decoding for place cells
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from matplotlib.patches import Rectangle
 import seaborn as sns
-from scipy import ndimage, stats
-from scipy.ndimage import label, center_of_mass
-from skimage import filters, measure
-from sklearn.decomposition import NMF
+from scipy.stats import poisson
+from scipy.ndimage import gaussian_filter1d
+from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -19,904 +17,800 @@ plt.style.use('seaborn-v0_8-whitegrid')
 np.random.seed(42)
 
 print("="*70)
-print("CALCIUM IMAGING ANALYSIS PIPELINE")
+print("BAYESIAN PLACE CELL DECODER")
 print("="*70)
 
-#%% PART 1: GENERATE SYNTHETIC CALCIUM IMAGING DATA
+#%% PART 1: SIMULATE PLACE CELLS
 
-def generate_synthetic_calcium_data(n_frames=1000, n_neurons=50, 
-                                   fov_size=(128, 128), 
-                                   stim_onset_frames=[100, 300, 500, 700]):
+class PlaceCell:
+    """Single place cell with Gaussian tuning curve"""
+    
+    def __init__(self, place_field_center, place_field_width, 
+                 peak_firing_rate, track_length=100):
+        self.center = place_field_center
+        self.width = place_field_width
+        self.peak_rate = peak_firing_rate
+        self.track_length = track_length
+        
+    def firing_rate(self, position):
+        """
+        Compute firing rate at given position(s)
+        Gaussian tuning curve
+        """
+        return self.peak_rate * np.exp(
+            -(position - self.center)**2 / (2 * self.width**2)
+        )
+    
+    def generate_spikes(self, position, dt=0.1):
+        """
+        Generate spike count using Poisson process
+        
+        Parameters:
+        -----------
+        position : float or array
+            Current position(s)
+        dt : float
+            Time bin size in seconds
+            
+        Returns:
+        --------
+        spike_count : int or array
+            Number of spikes in time bin
+        """
+        rate = self.firing_rate(position)
+        expected_spikes = rate * dt
+        return np.random.poisson(expected_spikes)
+
+
+def create_place_cell_population(n_cells=30, track_length=100,
+                                place_field_width_range=(5, 15),
+                                peak_rate_range=(5, 20)):
     """
-    Generate synthetic calcium imaging data
+    Create population of place cells tiling the track
     
     Parameters:
     -----------
-    n_frames : int
-        Number of time frames
-    n_neurons : int
-        Number of neurons to simulate
-    fov_size : tuple
-        Field of view size (height, width)
-    stim_onset_frames : list
-        Frame numbers where stimuli are presented
-    
+    n_cells : int
+        Number of place cells
+    track_length : float
+        Length of linear track (cm)
+    place_field_width_range : tuple
+        Range of place field widths (cm)
+    peak_rate_range : tuple
+        Range of peak firing rates (Hz)
+        
     Returns:
     --------
-    movie : ndarray (n_frames, height, width)
-        Simulated calcium imaging movie
-    true_neurons : list
-        List of dictionaries containing true neuron properties
+    place_cells : list
+        List of PlaceCell objects
     """
     
-    print("\nGenerating synthetic calcium imaging data...")
-    print(f"  FOV size: {fov_size}")
-    print(f"  Number of frames: {n_frames}")
-    print(f"  Number of neurons: {n_neurons}")
-    print(f"  Stimulus onsets: {stim_onset_frames}")
+    print(f"\nCreating {n_cells} place cells...")
     
-    height, width = fov_size
-    movie = np.zeros((n_frames, height, width))
+    place_cells = []
     
-    # Background fluorescence with slow drift
-    background_level = 100
-    drift = np.sin(np.linspace(0, 4*np.pi, n_frames)) * 20
+    # Tile the track uniformly
+    centers = np.linspace(0, track_length, n_cells + 2)[1:-1]
     
-    true_neurons = []
+    for i, center in enumerate(centers):
+        # Random width and peak rate
+        width = np.random.uniform(*place_field_width_range)
+        peak_rate = np.random.uniform(*peak_rate_range)
+        
+        cell = PlaceCell(center, width, peak_rate, track_length)
+        place_cells.append(cell)
     
-    for i in range(n_neurons):
-        # Random neuron location
-        y = np.random.randint(10, height-10)
-        x = np.random.randint(10, width-10)
-        
-        # Neuron size (soma)
-        radius = np.random.uniform(3, 6)
-        
-        # Create spatial footprint (Gaussian)
-        yy, xx = np.meshgrid(range(height), range(width), indexing='ij')
-        spatial_footprint = np.exp(-((yy - y)**2 + (xx - x)**2) / (2 * radius**2))
-        
-        # Temporal activity
-        # Decide if neuron is stimulus-responsive
-        is_responsive = np.random.rand() < 0.6  # 60% are responsive
-        
-        temporal_trace = np.zeros(n_frames)
-        
-        if is_responsive:
-            # Responsive: transients after stimuli
-            response_probability = np.random.uniform(0.5, 1.0)
-            response_amplitude = np.random.uniform(0.5, 2.0)
-            
-            for stim_frame in stim_onset_frames:
-                if np.random.rand() < response_probability:
-                    # Calcium transient (exponential decay)
-                    onset = stim_frame + np.random.randint(0, 5)
-                    tau_rise = 3
-                    tau_decay = 10
-                    
-                    t = np.arange(n_frames) - onset
-                    transient = np.zeros(n_frames)
-                    transient[t >= 0] = response_amplitude * (
-                        (1 - np.exp(-t[t >= 0] / tau_rise)) * 
-                        np.exp(-t[t >= 0] / tau_decay)
-                    )
-                    temporal_trace += transient
-        else:
-            # Non-responsive: spontaneous activity
-            n_spontaneous = np.random.randint(2, 8)
-            for _ in range(n_spontaneous):
-                onset = np.random.randint(0, n_frames - 50)
-                amplitude = np.random.uniform(0.3, 0.8)
-                tau_decay = 10
-                
-                t = np.arange(n_frames) - onset
-                transient = np.zeros(n_frames)
-                transient[t >= 0] = amplitude * np.exp(-t[t >= 0] / tau_decay)
-                temporal_trace += transient
-        
-        # Add baseline and noise
-        baseline = np.random.uniform(0.5, 1.5)
-        temporal_trace = baseline + temporal_trace
-        
-        # Add to movie
-        for t in range(n_frames):
-            movie[t] += spatial_footprint * temporal_trace[t]
-        
-        true_neurons.append({
-            'id': i,
-            'center': (y, x),
-            'radius': radius,
-            'spatial_footprint': spatial_footprint,
-            'temporal_trace': temporal_trace,
-            'is_responsive': is_responsive,
-            'baseline': baseline
-        })
+    print(f"✓ Created {n_cells} place cells")
+    print(f"  Place field centers: {min(centers):.1f} - {max(centers):.1f} cm")
+    print(f"  Place field widths: {place_field_width_range}")
+    print(f"  Peak firing rates: {peak_rate_range} Hz")
     
-    # Add background and noise
-    for t in range(n_frames):
-        movie[t] += background_level + drift[t]
-        movie[t] += np.random.randn(height, width) * 10  # Photon noise
+    return place_cells
+
+
+def simulate_trajectory(duration=60, track_length=100, dt=0.1, 
+                       velocity_range=(5, 15)):
+    """
+    Simulate animal's trajectory on linear track
     
-    # Add neuropil contamination (blurred version of signal)
-    neuropil = np.zeros_like(movie)
-    for t in range(n_frames):
-        neuropil[t] = ndimage.gaussian_filter(movie[t], sigma=5) * 0.3
-    movie += neuropil
+    Parameters:
+    -----------
+    duration : float
+        Duration in seconds
+    track_length : float
+        Track length (cm)
+    dt : float
+        Time step (seconds)
+    velocity_range : tuple
+        Range of velocities (cm/s)
+        
+    Returns:
+    --------
+    time : array
+        Time points
+    position : array
+        Position at each time point
+    """
     
-    print(f"\n✓ Generated {n_neurons} neurons")
-    print(f"  Responsive: {sum([n['is_responsive'] for n in true_neurons])}")
-    print(f"  Non-responsive: {sum([not n['is_responsive'] for n in true_neurons])}")
+    n_steps = int(duration / dt)
+    time = np.arange(n_steps) * dt
+    position = np.zeros(n_steps)
     
-    return movie, true_neurons, stim_onset_frames
+    # Start at random position
+    position[0] = np.random.uniform(0, track_length)
+    
+    # Random walk with variable velocity
+    direction = 1  # 1 = right, -1 = left
+    
+    for i in range(1, n_steps):
+        # Variable velocity
+        velocity = np.random.uniform(*velocity_range)
+        
+        # Update position
+        position[i] = position[i-1] + direction * velocity * dt
+        
+        # Bounce at boundaries
+        if position[i] >= track_length:
+            position[i] = track_length - (position[i] - track_length)
+            direction = -1
+        elif position[i] <= 0:
+            position[i] = -position[i]
+            direction = 1
+        
+        # Occasionally change direction
+        if np.random.rand() < 0.02:  # 2% chance per timestep
+            direction *= -1
+    
+    return time, position
+
+
+def generate_population_activity(place_cells, position, dt=0.1):
+    """
+    Generate spike counts for all place cells
+    
+    Parameters:
+    -----------
+    place_cells : list
+        List of PlaceCell objects
+    position : array
+        Position trajectory
+    dt : float
+        Time bin size
+        
+    Returns:
+    --------
+    spike_counts : array (n_cells, n_timepoints)
+        Spike counts for each cell at each time
+    firing_rates : array (n_cells, n_timepoints)
+        Underlying firing rates
+    """
+    
+    n_cells = len(place_cells)
+    n_timepoints = len(position)
+    
+    spike_counts = np.zeros((n_cells, n_timepoints))
+    firing_rates = np.zeros((n_cells, n_timepoints))
+    
+    for i, cell in enumerate(place_cells):
+        firing_rates[i] = cell.firing_rate(position)
+        spike_counts[i] = cell.generate_spikes(position, dt)
+    
+    return spike_counts, firing_rates
+
 
 # Generate data
-movie, true_neurons, stim_frames = generate_synthetic_calcium_data(
-    n_frames=1000,
-    n_neurons=50,
-    fov_size=(128, 128),
-    stim_onset_frames=[100, 300, 500, 700]
-)
+print("\n" + "="*70)
+print("PART 1: Simulate Place Cell Population")
+print("="*70)
 
-print(f"\nMovie shape: {movie.shape}")
-print(f"Movie range: [{movie.min():.1f}, {movie.max():.1f}]")
+n_cells = 30
+track_length = 100
+duration = 60
+dt = 0.1
+
+place_cells = create_place_cell_population(n_cells, track_length)
+
+print(f"\nSimulating {duration}s trajectory...")
+time, true_position = simulate_trajectory(duration, track_length, dt)
+
+print(f"\nGenerating population activity...")
+spike_counts, firing_rates = generate_population_activity(place_cells, true_position, dt)
+
+print(f"✓ Generated data")
+print(f"  Time points: {len(time)}")
+print(f"  Total spikes: {spike_counts.sum():.0f}")
+print(f"  Mean firing rate: {spike_counts.sum() / (n_cells * duration):.2f} Hz")
 
 
-#%% PART 2: ROI EXTRACTION
+#%% PART 2: BAYESIAN DECODER
 
-def extract_rois_correlation_pnr(movie, gSig=3, min_pnr=10, min_corr=0.8):
+class BayesianDecoder:
     """
-    Extract ROIs using correlation and peak-to-noise ratio
-    Simplified version of CaImAn's approach
-    
-    Parameters:
-    -----------
-    movie : ndarray (n_frames, height, width)
-        Calcium imaging movie
-    gSig : int
-        Expected neuron radius
-    min_pnr : float
-        Minimum peak-to-noise ratio
-    min_corr : float
-        Minimum local correlation
-    
-    Returns:
-    --------
-    rois : list of dicts
-        Detected ROIs with spatial footprints
+    Bayesian decoder for place cells
+    P(position | spikes) ∝ P(spikes | position) * P(position)
     """
     
-    print("\n" + "="*70)
-    print("PART 2: ROI Extraction")
-    print("="*70)
+    def __init__(self, place_cells, track_length=100, position_bins=100):
+        self.place_cells = place_cells
+        self.track_length = track_length
+        self.n_cells = len(place_cells)
+        
+        # Discretize position space
+        self.position_bins = position_bins
+        self.positions = np.linspace(0, track_length, position_bins)
+        self.bin_width = self.positions[1] - self.positions[0]
+        
+        # Compute tuning curves for all positions
+        self.tuning_curves = self._compute_tuning_curves()
+        
+    def _compute_tuning_curves(self):
+        """Precompute firing rates at all positions"""
+        tuning = np.zeros((self.n_cells, self.position_bins))
+        
+        for i, cell in enumerate(self.place_cells):
+            tuning[i] = cell.firing_rate(self.positions)
+        
+        return tuning
     
-    n_frames, height, width = movie.shape
-    
-    # Compute local correlation image
-    print("\nComputing local correlation map...")
-    cn_filter = np.ones((2*gSig+1, 2*gSig+1))
-    cn_filter /= cn_filter.sum()
-    
-    # Mean image
-    mean_img = np.mean(movie, axis=0)
-    
-    # Local correlation
-    corr_img = np.zeros((height, width))
-    for y in range(gSig, height-gSig):
-        for x in range(gSig, width-gSig):
-            center_trace = movie[:, y, x]
-            neighbor_traces = []
+    def decode(self, spike_counts, dt=0.1, prior=None):
+        """
+        Decode position from spike counts
+        
+        Parameters:
+        -----------
+        spike_counts : array (n_cells,) or (n_cells, n_timepoints)
+            Observed spike counts
+        dt : float
+            Time bin size
+        prior : array or None
+            Prior distribution over positions (uniform if None)
             
-            for dy in range(-gSig, gSig+1):
-                for dx in range(-gSig, gSig+1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    neighbor_traces.append(movie[:, y+dy, x+dx])
+        Returns:
+        --------
+        decoded_position : float or array
+            Most likely position(s)
+        posterior : array
+            Posterior distribution(s)
+        """
+        
+        # Handle single timepoint
+        if spike_counts.ndim == 1:
+            spike_counts = spike_counts.reshape(-1, 1)
+        
+        n_timepoints = spike_counts.shape[1]
+        decoded_positions = np.zeros(n_timepoints)
+        posteriors = np.zeros((self.position_bins, n_timepoints))
+        
+        # Uniform prior if not provided
+        if prior is None:
+            prior = np.ones(self.position_bins) / self.position_bins
+        
+        for t in range(n_timepoints):
+            # Compute likelihood for each position
+            # P(spikes | position) using Poisson likelihood
+            likelihood = np.ones(self.position_bins)
             
-            if len(neighbor_traces) > 0:
-                neighbor_traces = np.array(neighbor_traces)
-                correlations = [np.corrcoef(center_trace, nt)[0, 1] 
-                               for nt in neighbor_traces]
-                corr_img[y, x] = np.mean(correlations)
-    
-    # Compute peak-to-noise ratio
-    print("Computing peak-to-noise ratio...")
-    pnr_img = np.zeros((height, width))
-    for y in range(height):
-        for x in range(width):
-            trace = movie[:, y, x]
-            peak = np.percentile(trace, 95)
-            noise = np.std(trace)
-            if noise > 0:
-                pnr_img[y, x] = peak / noise
-    
-    # Find candidate pixels
-    print("Identifying candidate pixels...")
-    candidates = (corr_img > min_corr) & (pnr_img > min_pnr)
-    
-    # Label connected components
-    labeled, n_components = label(candidates)
-    
-    print(f"\nFound {n_components} candidate regions")
-    
-    # Extract ROIs
-    rois = []
-    for i in range(1, n_components + 1):
-        mask = labeled == i
-        
-        # Size filter
-        area = np.sum(mask)
-        if area < 10 or area > 500:  # Reasonable neuron size
-            continue
-        
-        # Extract spatial footprint
-        footprint = np.zeros((height, width))
-        
-        # Get bounding box
-        ys, xs = np.where(mask)
-        y_min, y_max = ys.min(), ys.max()
-        x_min, x_max = xs.min(), xs.max()
-        
-        # Refine footprint using local correlation
-        footprint[mask] = corr_img[mask]
-        
-        # Normalize
-        if footprint.sum() > 0:
-            footprint /= footprint.sum()
-        
-        rois.append({
-            'id': len(rois),
-            'mask': mask,
-            'footprint': footprint,
-            'center': center_of_mass(mask),
-            'area': area,
-            'bbox': (y_min, y_max, x_min, x_max)
-        })
-    
-    print(f"\n✓ Extracted {len(rois)} ROIs")
-    
-    return rois, corr_img, pnr_img
-
-# Extract ROIs
-rois, corr_img, pnr_img = extract_rois_correlation_pnr(
-    movie, gSig=4, min_pnr=8, min_corr=0.6
-)
-
-
-#%% PART 3: EXTRACT FLUORESCENCE TRACES
-
-def extract_fluorescence_traces(movie, rois):
-    """
-    Extract raw fluorescence traces from ROIs
-    
-    Parameters:
-    -----------
-    movie : ndarray
-        Calcium imaging movie
-    rois : list
-        List of ROI dictionaries
-        
-    Returns:
-    --------
-    traces : ndarray (n_rois, n_frames)
-        Raw fluorescence traces
-    """
-    
-    print("\n" + "="*70)
-    print("PART 3: Extract Fluorescence Traces")
-    print("="*70)
-    
-    n_frames = movie.shape[0]
-    n_rois = len(rois)
-    
-    traces = np.zeros((n_rois, n_frames))
-    
-    print(f"\nExtracting traces for {n_rois} ROIs...")
-    
-    for i, roi in enumerate(rois):
-        footprint = roi['footprint']
-        
-        # Weighted sum using spatial footprint
-        for t in range(n_frames):
-            traces[i, t] = np.sum(movie[t] * footprint)
-    
-    print(f"✓ Extracted traces shape: {traces.shape}")
-    
-    return traces
-
-# Extract traces
-raw_traces = extract_fluorescence_traces(movie, rois)
-
-
-#%% PART 4: NEUROPIL CORRECTION
-
-def compute_neuropil_traces(movie, rois, neuropil_radius=10):
-    """
-    Compute neuropil contamination for each ROI
-    
-    Parameters:
-    -----------
-    movie : ndarray
-        Calcium imaging movie
-    rois : list
-        List of ROIs
-    neuropil_radius : int
-        Radius for neuropil region
-        
-    Returns:
-    --------
-    neuropil_traces : ndarray
-        Neuropil fluorescence traces
-    """
-    
-    print("\n" + "="*70)
-    print("PART 4: Neuropil Correction")
-    print("="*70)
-    
-    n_frames, height, width = movie.shape
-    n_rois = len(rois)
-    
-    neuropil_traces = np.zeros((n_rois, n_frames))
-    
-    print(f"\nComputing neuropil for {n_rois} ROIs...")
-    
-    for i, roi in enumerate(rois):
-        # Create neuropil mask (annulus around ROI)
-        mask = roi['mask']
-        
-        # Dilate to get surrounding region
-        dilated = ndimage.binary_dilation(mask, iterations=neuropil_radius)
-        neuropil_mask = dilated & ~mask
-        
-        # Extract neuropil trace
-        for t in range(n_frames):
-            if neuropil_mask.sum() > 0:
-                neuropil_traces[i, t] = np.mean(movie[t][neuropil_mask])
-    
-    print(f"✓ Computed neuropil traces")
-    
-    return neuropil_traces
-
-def correct_neuropil(raw_traces, neuropil_traces, alpha=0.7):
-    """
-    Correct for neuropil contamination
-    
-    F_corrected = F_raw - alpha * F_neuropil
-    """
-    
-    print(f"\nApplying neuropil correction (alpha={alpha})...")
-    corrected_traces = raw_traces - alpha * neuropil_traces
-    
-    return corrected_traces
-
-# Compute and correct neuropil
-neuropil_traces = compute_neuropil_traces(movie, rois)
-corrected_traces = correct_neuropil(raw_traces, neuropil_traces, alpha=0.7)
-
-
-#%% PART 5: COMPUTE dF/F
-
-def compute_dff(traces, percentile=8, window=500):
-    """
-    Compute dF/F using rolling baseline
-    
-    Parameters:
-    -----------
-    traces : ndarray
-        Fluorescence traces
-    percentile : float
-        Percentile for baseline estimation
-    window : int
-        Window size for baseline estimation
-        
-    Returns:
-    --------
-    dff : ndarray
-        dF/F traces
-    """
-    
-    print("\n" + "="*70)
-    print("PART 5: Compute dF/F")
-    print("="*70)
-    
-    n_rois, n_frames = traces.shape
-    dff = np.zeros_like(traces)
-    
-    print(f"\nComputing dF/F for {n_rois} ROIs...")
-    print(f"  Baseline: {percentile}th percentile")
-    print(f"  Window: {window} frames")
-    
-    for i in range(n_rois):
-        trace = traces[i]
-        
-        # Rolling baseline
-        baseline = np.zeros(n_frames)
-        half_window = window // 2
-        
-        for t in range(n_frames):
-            start = max(0, t - half_window)
-            end = min(n_frames, t + half_window)
-            baseline[t] = np.percentile(trace[start:end], percentile)
-        
-        # Compute dF/F
-        dff[i] = (trace - baseline) / baseline
-    
-    print(f"✓ Computed dF/F")
-    print(f"  dF/F range: [{dff.min():.2f}, {dff.max():.2f}]")
-    
-    return dff
-
-# Compute dF/F
-dff_traces = compute_dff(corrected_traces)
-
-
-#%% PART 6: STIMULUS RESPONSE CLASSIFICATION
-
-def classify_stimulus_responsive(dff, stim_frames, 
-                                 pre_window=10, post_window=30,
-                                 n_permutations=1000, alpha=0.05):
-    """
-    Classify cells as stimulus-responsive using permutation test
-    
-    Parameters:
-    -----------
-    dff : ndarray (n_cells, n_frames)
-        dF/F traces
-    stim_frames : list
-        Stimulus onset frames
-    pre_window : int
-        Frames before stimulus for baseline
-    post_window : int
-        Frames after stimulus for response
-    n_permutations : int
-        Number of shuffles for null distribution
-    alpha : float
-        Significance threshold
-        
-    Returns:
-    --------
-    results : dict
-        Classification results for each cell
-    """
-    
-    print("\n" + "="*70)
-    print("PART 6: Stimulus Response Classification")
-    print("="*70)
-    
-    n_cells, n_frames = dff.shape
-    n_trials = len(stim_frames)
-    
-    print(f"\nClassifying {n_cells} cells...")
-    print(f"  Number of trials: {n_trials}")
-    print(f"  Pre-stimulus window: {pre_window} frames")
-    print(f"  Post-stimulus window: {post_window} frames")
-    print(f"  Permutations: {n_permutations}")
-    
-    results = []
-    
-    for cell_id in range(n_cells):
-        trace = dff[cell_id]
-        
-        # Extract trial responses
-        trial_responses = []
-        baselines = []
-        
-        for stim_frame in stim_frames:
-            if stim_frame - pre_window >= 0 and stim_frame + post_window < n_frames:
-                baseline = np.mean(trace[stim_frame - pre_window:stim_frame])
-                response = np.mean(trace[stim_frame:stim_frame + post_window])
-                
-                trial_responses.append(response - baseline)
-                baselines.append(baseline)
-        
-        # Real mean response
-        real_response = np.mean(trial_responses)
-        
-        # Permutation test
-        null_distribution = []
-        
-        for _ in range(n_permutations):
-            # Shuffle trial labels
-            shuffled_frames = np.random.choice(
-                range(pre_window, n_frames - post_window),
-                size=n_trials,
-                replace=False
-            )
+            for pos_idx in range(self.position_bins):
+                for cell_idx in range(self.n_cells):
+                    # Expected rate at this position
+                    expected_rate = self.tuning_curves[cell_idx, pos_idx]
+                    expected_count = expected_rate * dt
+                    
+                    # Poisson probability
+                    observed_count = spike_counts[cell_idx, t]
+                    likelihood[pos_idx] *= poisson.pmf(
+                        observed_count, expected_count
+                    )
             
-            shuffled_responses = []
-            for shuf_frame in shuffled_frames:
-                baseline = np.mean(trace[shuf_frame - pre_window:shuf_frame])
-                response = np.mean(trace[shuf_frame:shuf_frame + post_window])
-                shuffled_responses.append(response - baseline)
+            # Posterior = likelihood * prior
+            posterior = likelihood * prior
             
-            null_distribution.append(np.mean(shuffled_responses))
+            # Normalize
+            if posterior.sum() > 0:
+                posterior /= posterior.sum()
+            else:
+                posterior = prior
+            
+            posteriors[:, t] = posterior
+            
+            # Maximum a posteriori estimate
+            decoded_positions[t] = self.positions[np.argmax(posterior)]
         
-        null_distribution = np.array(null_distribution)
+        if n_timepoints == 1:
+            return decoded_positions[0], posteriors[:, 0]
         
-        # Compute p-value (two-tailed)
-        p_value = np.mean(np.abs(null_distribution) >= np.abs(real_response))
-        
-        # Classify
-        is_responsive = p_value < alpha
-        
-        # Compute reliability (trial-to-trial correlation)
-        if len(trial_responses) > 1:
-            reliability = np.corrcoef(trial_responses, trial_responses)[0, 1]
-            if np.isnan(reliability):
-                reliability = 0
-        else:
-            reliability = 0
-        
-        results.append({
-            'cell_id': cell_id,
-            'mean_response': real_response,
-            'trial_responses': trial_responses,
-            'p_value': p_value,
-            'is_responsive': is_responsive,
-            'reliability': reliability,
-            'n_trials': len(trial_responses)
-        })
+        return decoded_positions, posteriors
+
+
+print("\n" + "="*70)
+print("PART 2: Bayesian Decoder")
+print("="*70)
+
+bayesian_decoder = BayesianDecoder(place_cells, track_length)
+print(f"\n✓ Initialized Bayesian decoder")
+print(f"  Position bins: {bayesian_decoder.position_bins}")
+
+print(f"\nDecoding trajectory...")
+decoded_position_bayes, posteriors = bayesian_decoder.decode(spike_counts, dt)
+
+# Compute decoding error
+decoding_error_bayes = np.abs(decoded_position_bayes - true_position)
+print(f"✓ Bayesian decoding complete")
+print(f"  Mean absolute error: {np.mean(decoding_error_bayes):.2f} cm")
+print(f"  Median absolute error: {np.median(decoding_error_bayes):.2f} cm")
+
+
+#%% PART 3: POPULATION VECTOR DECODER
+
+class PopulationVectorDecoder:
+    """
+    Population vector decoder
+    Weighted average of preferred positions by firing rate
+    """
     
-    n_responsive = sum([r['is_responsive'] for r in results])
-    print(f"\n✓ Classification complete")
-    print(f"  Responsive cells: {n_responsive}/{n_cells} ({100*n_responsive/n_cells:.1f}%)")
-    print(f"  Non-responsive: {n_cells - n_responsive}/{n_cells}")
+    def __init__(self, place_cells, track_length=100):
+        self.place_cells = place_cells
+        self.track_length = track_length
+        self.n_cells = len(place_cells)
+        
+        # Preferred positions
+        self.preferred_positions = np.array([cell.center for cell in place_cells])
+    
+    def decode(self, spike_counts, dt=0.1):
+        """
+        Decode position using population vector
+        
+        Parameters:
+        -----------
+        spike_counts : array (n_cells,) or (n_cells, n_timepoints)
+            Observed spike counts
+        dt : float
+            Time bin size
+            
+        Returns:
+        --------
+        decoded_position : float or array
+            Decoded position(s)
+        """
+        
+        if spike_counts.ndim == 1:
+            spike_counts = spike_counts.reshape(-1, 1)
+        
+        n_timepoints = spike_counts.shape[1]
+        decoded_positions = np.zeros(n_timepoints)
+        
+        for t in range(n_timepoints):
+            # Weighted average
+            weights = spike_counts[:, t]
+            
+            if weights.sum() > 0:
+                decoded_positions[t] = np.average(
+                    self.preferred_positions, 
+                    weights=weights
+                )
+            else:
+                # Default to center if no spikes
+                decoded_positions[t] = self.track_length / 2
+        
+        if n_timepoints == 1:
+            return decoded_positions[0]
+        
+        return decoded_positions
+
+
+print("\n" + "="*70)
+print("PART 3: Population Vector Decoder")
+print("="*70)
+
+pv_decoder = PopulationVectorDecoder(place_cells, track_length)
+print(f"\n✓ Initialized Population Vector decoder")
+
+print(f"\nDecoding trajectory...")
+decoded_position_pv = pv_decoder.decode(spike_counts, dt)
+
+decoding_error_pv = np.abs(decoded_position_pv - true_position)
+print(f"✓ Population Vector decoding complete")
+print(f"  Mean absolute error: {np.mean(decoding_error_pv):.2f} cm")
+print(f"  Median absolute error: {np.median(decoding_error_pv):.2f} cm")
+
+
+#%% PART 4: VISUALIZATION 1 - TRUE VS DECODED POSITION
+
+print("\n" + "="*70)
+print("PART 4: Visualizations")
+print("="*70)
+
+fig = plt.figure(figsize=(15, 10))
+gs = GridSpec(4, 1, figure=fig, hspace=0.3)
+
+# Plot 1: True vs decoded position (Bayesian)
+ax1 = fig.add_subplot(gs[0])
+time_window = slice(0, 200)  # First 20 seconds
+
+ax1.plot(time[time_window], true_position[time_window], 
+        'k-', linewidth=2, label='True position', alpha=0.7)
+ax1.plot(time[time_window], decoded_position_bayes[time_window], 
+        'r-', linewidth=1.5, label='Bayesian decoder', alpha=0.8)
+
+ax1.set_ylabel('Position (cm)', fontsize=11)
+ax1.set_title('True vs Decoded Position (Bayesian)', 
+             fontsize=12, fontweight='bold')
+ax1.legend(fontsize=10, loc='upper right')
+ax1.grid(True, alpha=0.3)
+ax1.set_xlim(time[time_window][0], time[time_window][-1])
+
+# Plot 2: True vs decoded position (Population Vector)
+ax2 = fig.add_subplot(gs[1])
+
+ax2.plot(time[time_window], true_position[time_window], 
+        'k-', linewidth=2, label='True position', alpha=0.7)
+ax2.plot(time[time_window], decoded_position_pv[time_window], 
+        'b-', linewidth=1.5, label='Population Vector', alpha=0.8)
+
+ax2.set_ylabel('Position (cm)', fontsize=11)
+ax2.set_title('True vs Decoded Position (Population Vector)', 
+             fontsize=12, fontweight='bold')
+ax2.legend(fontsize=10, loc='upper right')
+ax2.grid(True, alpha=0.3)
+ax2.set_xlim(time[time_window][0], time[time_window][-1])
+
+# Plot 3: Comparison
+ax3 = fig.add_subplot(gs[2])
+
+ax3.plot(time[time_window], true_position[time_window], 
+        'k-', linewidth=2.5, label='True position', alpha=0.7)
+ax3.plot(time[time_window], decoded_position_bayes[time_window], 
+        'r-', linewidth=1.5, label='Bayesian', alpha=0.8)
+ax3.plot(time[time_window], decoded_position_pv[time_window], 
+        'b-', linewidth=1.5, label='Population Vector', alpha=0.8)
+
+ax3.set_ylabel('Position (cm)', fontsize=11)
+ax3.set_title('Decoder Comparison', fontsize=12, fontweight='bold')
+ax3.legend(fontsize=10, loc='upper right')
+ax3.grid(True, alpha=0.3)
+ax3.set_xlim(time[time_window][0], time[time_window][-1])
+
+# Plot 4: Decoding errors
+ax4 = fig.add_subplot(gs[3])
+
+ax4.plot(time[time_window], decoding_error_bayes[time_window], 
+        'r-', linewidth=1.5, label='Bayesian error', alpha=0.7)
+ax4.plot(time[time_window], decoding_error_pv[time_window], 
+        'b-', linewidth=1.5, label='Pop. Vector error', alpha=0.7)
+
+ax4.set_xlabel('Time (s)', fontsize=11)
+ax4.set_ylabel('Decoding Error (cm)', fontsize=11)
+ax4.set_title('Decoding Errors Over Time', fontsize=12, fontweight='bold')
+ax4.legend(fontsize=10, loc='upper right')
+ax4.grid(True, alpha=0.3)
+ax4.set_xlim(time[time_window][0], time[time_window][-1])
+
+plt.suptitle('Place Cell Decoding: True vs Decoded Position (60s session)',
+            fontsize=14, fontweight='bold')
+plt.savefig('decoder_position_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+#%% PART 5: DECODING ERROR VS NUMBER OF CELLS
+
+print("\nAnalyzing effect of population size...")
+
+def analyze_population_size(place_cells, true_position, spike_counts, dt,
+                           max_cells=30, n_repeats=10):
+    """
+    Test decoding accuracy vs number of cells included
+    """
+    
+    cell_counts = np.arange(5, max_cells + 1, 5)
+    
+    results = {
+        'n_cells': cell_counts,
+        'bayes_error_mean': [],
+        'bayes_error_std': [],
+        'pv_error_mean': [],
+        'pv_error_std': []
+    }
+    
+    for n in tqdm(cell_counts, desc="Population size"):
+        bayes_errors = []
+        pv_errors = []
+        
+        for _ in range(n_repeats):
+            # Randomly select n cells
+            cell_indices = np.random.choice(len(place_cells), n, replace=False)
+            selected_cells = [place_cells[i] for i in cell_indices]
+            selected_spikes = spike_counts[cell_indices]
+            
+            # Bayesian decoder
+            decoder_bayes = BayesianDecoder(selected_cells, track_length)
+            decoded_bayes, _ = decoder_bayes.decode(selected_spikes, dt)
+            error_bayes = np.mean(np.abs(decoded_bayes - true_position))
+            bayes_errors.append(error_bayes)
+            
+            # Population vector decoder
+            decoder_pv = PopulationVectorDecoder(selected_cells, track_length)
+            decoded_pv = decoder_pv.decode(selected_spikes, dt)
+            error_pv = np.mean(np.abs(decoded_pv - true_position))
+            pv_errors.append(error_pv)
+        
+        results['bayes_error_mean'].append(np.mean(bayes_errors))
+        results['bayes_error_std'].append(np.std(bayes_errors))
+        results['pv_error_mean'].append(np.mean(pv_errors))
+        results['pv_error_std'].append(np.std(pv_errors))
     
     return results
 
-# Classify cells
-classification_results = classify_stimulus_responsive(
-    dff_traces, 
-    stim_frames,
-    n_permutations=1000
+population_size_results = analyze_population_size(
+    place_cells, true_position, spike_counts, dt,
+    max_cells=30, n_repeats=10
 )
 
+# Plot
+fig, ax = plt.subplots(figsize=(10, 6))
 
-#%% PART 7: VISUALIZATIONS
+ax.errorbar(population_size_results['n_cells'],
+           population_size_results['bayes_error_mean'],
+           yerr=population_size_results['bayes_error_std'],
+           marker='o', capsize=5, linewidth=2, markersize=8,
+           color='red', label='Bayesian decoder')
 
-print("\n" + "="*70)
-print("PART 7: Generating Visualizations")
-print("="*70)
+ax.errorbar(population_size_results['n_cells'],
+           population_size_results['pv_error_mean'],
+           yerr=population_size_results['pv_error_std'],
+           marker='s', capsize=5, linewidth=2, markersize=8,
+           color='blue', label='Population Vector')
 
-# Visualization 1: Spatial map of ROIs
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-# Mean image
-ax = axes[0]
-mean_img = np.mean(movie, axis=0)
-ax.imshow(mean_img, cmap='gray')
-ax.set_title('Mean Image', fontsize=12, fontweight='bold')
-ax.axis('off')
-
-# ROIs colored by responsiveness
-ax = axes[1]
-ax.imshow(mean_img, cmap='gray', alpha=0.5)
-
-for roi, result in zip(rois, classification_results):
-    y, x = roi['center']
-    color = 'red' if result['is_responsive'] else 'blue'
-    
-    circle = plt.Circle((x, y), radius=5, 
-                       color=color, fill=False, linewidth=2)
-    ax.add_patch(circle)
-    
-    # Add cell ID
-    ax.text(x, y, str(roi['id']), 
-           fontsize=6, color='white', 
-           ha='center', va='center',
-           bbox=dict(boxstyle='circle', facecolor=color, alpha=0.7))
-
-ax.set_title(f'ROI Map (Red=Responsive, Blue=Non-responsive)', 
-            fontsize=12, fontweight='bold')
-ax.axis('off')
-
-# Correlation and PNR maps
-ax = axes[2]
-im = ax.imshow(corr_img, cmap='hot')
-ax.set_title('Local Correlation Map', fontsize=12, fontweight='bold')
-ax.axis('off')
-plt.colorbar(im, ax=ax, fraction=0.046)
-
-plt.tight_layout()
-plt.savefig('calcium_roi_maps.png', dpi=150, bbox_inches='tight')
-plt.show()
-
-
-# Visualization 2: Example dF/F traces
-fig, axes = plt.subplots(5, 2, figsize=(14, 12))
-axes = axes.flatten()
-
-# Select 10 example cells (mix of responsive and non-responsive)
-responsive_cells = [r['cell_id'] for r in classification_results if r['is_responsive']]
-non_responsive_cells = [r['cell_id'] for r in classification_results if not r['is_responsive']]
-
-example_cells = (responsive_cells[:5] if len(responsive_cells) >= 5 else responsive_cells) + \
-                (non_responsive_cells[:5] if len(non_responsive_cells) >= 5 else non_responsive_cells)
-
-time_axis = np.arange(dff_traces.shape[1]) / 30.0  # Assuming 30 Hz
-
-for idx, cell_id in enumerate(example_cells[:10]):
-    ax = axes[idx]
-    
-    # Plot trace
-    ax.plot(time_axis, dff_traces[cell_id], linewidth=1, color='black')
-    
-    # Mark stimulus times
-    for stim_frame in stim_frames:
-        ax.axvline(x=stim_frame/30.0, color='red', linestyle='--', 
-                  alpha=0.5, linewidth=1)
-    
-    # Get result
-    result = classification_results[cell_id]
-    
-    # Title with classification
-    status = "RESPONSIVE" if result['is_responsive'] else "Non-responsive"
-    color = 'red' if result['is_responsive'] else 'blue'
-    
-    ax.set_title(f"Cell {cell_id} - {status} (p={result['p_value']:.3f})",
-                fontsize=10, fontweight='bold', color=color)
-    
-    ax.set_xlabel('Time (s)', fontsize=9)
-    ax.set_ylabel('dF/F', fontsize=9)
-    ax.grid(True, alpha=0.3)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-
-plt.suptitle('Example dF/F Traces (Red lines = stimulus onset)', 
-            fontsize=14, fontweight='bold')
-plt.tight_layout()
-plt.savefig('calcium_example_traces.png', dpi=150, bbox_inches='tight')
-plt.show()
-
-
-# Visualization 3: Response amplitude vs reliability scatter plot
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-# Extract metrics
-mean_responses = [r['mean_response'] for r in classification_results]
-reliabilities = [r['reliability'] for r in classification_results]
-is_responsive = [r['is_responsive'] for r in classification_results]
-p_values = [r['p_value'] for r in classification_results]
-
-# Scatter plot
-ax = axes[0]
-responsive_mask = np.array(is_responsive)
-
-ax.scatter(np.array(mean_responses)[~responsive_mask],
-          np.array(reliabilities)[~responsive_mask],
-          c='blue', alpha=0.6, s=60, label='Non-responsive', edgecolors='black')
-
-ax.scatter(np.array(mean_responses)[responsive_mask],
-          np.array(reliabilities)[responsive_mask],
-          c='red', alpha=0.6, s=60, label='Responsive', edgecolors='black')
-
-ax.set_xlabel('Mean Response Amplitude (dF/F)', fontsize=12)
-ax.set_ylabel('Reliability (Trial correlation)', fontsize=12)
-ax.set_title('Response Amplitude vs. Reliability', fontsize=13, fontweight='bold')
-ax.legend(fontsize=11)
-ax.grid(True, alpha=0.3)
-ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-ax.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
-
-# P-value distribution
-ax = axes[1]
-ax.hist(p_values, bins=20, color='purple', alpha=0.7, edgecolor='black')
-ax.axvline(x=0.05, color='red', linestyle='--', linewidth=2, 
-          label='α = 0.05')
-ax.set_xlabel('P-value', fontsize=12)
-ax.set_ylabel('Count', fontsize=12)
-ax.set_title('P-value Distribution (Permutation Test)', 
+ax.set_xlabel('Number of Cells', fontsize=12)
+ax.set_ylabel('Mean Absolute Error (cm)', fontsize=12)
+ax.set_title('Decoding Error vs Population Size',
             fontsize=13, fontweight='bold')
 ax.legend(fontsize=11)
-ax.grid(True, alpha=0.3, axis='y')
+ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('calcium_response_analysis.png', dpi=150, bbox_inches='tight')
+plt.savefig('decoder_population_size.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 
-# Visualization 4: Trial-averaged responses
+#%% PART 6: DECODER COMPARISON ACROSS NOISE LEVELS
+
+print("\nAnalyzing decoder robustness to noise...")
+
+def compare_decoders_noise(place_cells, true_position, dt,
+                          noise_levels=np.linspace(0, 2, 11)):
+    """
+    Compare decoder performance across noise levels
+    Noise added as multiplicative factor on spike counts
+    """
+    
+    results = {
+        'noise_levels': noise_levels,
+        'bayes_error': [],
+        'pv_error': [],
+        'bayes_std': [],
+        'pv_std': []
+    }
+    
+    for noise_factor in tqdm(noise_levels, desc="Noise level"):
+        # Generate clean spikes
+        _, clean_rates = generate_population_activity(place_cells, true_position, dt)
+        
+        # Add noise
+        noisy_spikes = np.zeros_like(clean_rates)
+        for i in range(clean_rates.shape[0]):
+            for t in range(clean_rates.shape[1]):
+                # Add noise to expected rate
+                noisy_rate = clean_rates[i, t] * (1 + noise_factor * np.random.randn())
+                noisy_rate = max(0, noisy_rate)  # Keep positive
+                noisy_spikes[i, t] = np.random.poisson(noisy_rate * dt)
+        
+        # Decode with Bayesian
+        decoder_bayes = BayesianDecoder(place_cells, track_length)
+        decoded_bayes, _ = decoder_bayes.decode(noisy_spikes, dt)
+        error_bayes = np.abs(decoded_bayes - true_position)
+        
+        # Decode with Population Vector
+        decoder_pv = PopulationVectorDecoder(place_cells, track_length)
+        decoded_pv = decoder_pv.decode(noisy_spikes, dt)
+        error_pv = np.abs(decoded_pv - true_position)
+        
+        results['bayes_error'].append(np.mean(error_bayes))
+        results['bayes_std'].append(np.std(error_bayes))
+        results['pv_error'].append(np.mean(error_pv))
+        results['pv_std'].append(np.std(error_pv))
+    
+    return results
+
+noise_results = compare_decoders_noise(place_cells, true_position, dt)
+
+# Plot
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Mean error
+ax1.plot(noise_results['noise_levels'],
+        noise_results['bayes_error'],
+        marker='o', linewidth=2, markersize=8,
+        color='red', label='Bayesian decoder')
+
+ax1.plot(noise_results['noise_levels'],
+        noise_results['pv_error'],
+        marker='s', linewidth=2, markersize=8,
+        color='blue', label='Population Vector')
+
+ax1.set_xlabel('Noise Level (σ)', fontsize=12)
+ax1.set_ylabel('Mean Absolute Error (cm)', fontsize=12)
+ax1.set_title('Decoder Performance vs Noise Level',
+             fontsize=13, fontweight='bold')
+ax1.legend(fontsize=11)
+ax1.grid(True, alpha=0.3)
+
+# Error ratio
+ratio = np.array(noise_results['pv_error']) / np.array(noise_results['bayes_error'])
+ax2.plot(noise_results['noise_levels'], ratio,
+        marker='o', linewidth=2, markersize=8, color='purple')
+ax2.axhline(y=1, color='gray', linestyle='--', linewidth=2, alpha=0.5)
+ax2.set_xlabel('Noise Level (σ)', fontsize=12)
+ax2.set_ylabel('Error Ratio (PV / Bayesian)', fontsize=12)
+ax2.set_title('Relative Performance\n(>1 = Bayesian better)',
+             fontsize=13, fontweight='bold')
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('decoder_noise_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+#%% PART 7: ADDITIONAL VISUALIZATIONS
+
+# Tuning curves
 fig, axes = plt.subplots(2, 3, figsize=(15, 8))
 axes = axes.flatten()
 
-# Select top 6 responsive cells
-responsive_results = [r for r in classification_results if r['is_responsive']]
-responsive_results = sorted(responsive_results, key=lambda x: x['mean_response'], reverse=True)
+positions_plot = np.linspace(0, track_length, 200)
 
-for idx, result in enumerate(responsive_results[:6]):
+for idx in range(6):
     ax = axes[idx]
+    cell = place_cells[idx]
     
-    cell_id = result['cell_id']
+    rates = cell.firing_rate(positions_plot)
+    ax.plot(positions_plot, rates, linewidth=2, color='blue')
+    ax.axvline(x=cell.center, color='red', linestyle='--', 
+              linewidth=1.5, label=f'Center: {cell.center:.1f} cm')
     
-    # Extract peri-stimulus traces
-    pre_frames = 20
-    post_frames = 50
-    
-    trial_traces = []
-    for stim_frame in stim_frames:
-        if stim_frame - pre_frames >= 0 and stim_frame + post_frames < dff_traces.shape[1]:
-            trial_trace = dff_traces[cell_id, stim_frame-pre_frames:stim_frame+post_frames]
-            trial_traces.append(trial_trace)
-    
-    trial_traces = np.array(trial_traces)
-    time = (np.arange(-pre_frames, post_frames) / 30.0) * 1000  # ms
-    
-    # Plot individual trials
-    for trial in trial_traces:
-        ax.plot(time, trial, color='gray', alpha=0.3, linewidth=0.5)
-    
-    # Plot mean
-    mean_trace = np.mean(trial_traces, axis=0)
-    sem_trace = stats.sem(trial_traces, axis=0)
-    
-    ax.plot(time, mean_trace, color='red', linewidth=2, label='Mean')
-    ax.fill_between(time, mean_trace - sem_trace, mean_trace + sem_trace,
-                    color='red', alpha=0.3, label='SEM')
-    
-    ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
-    ax.axhline(y=0, color='gray', linestyle=':', alpha=0.5)
-    
-    ax.set_xlabel('Time from stimulus (ms)', fontsize=9)
-    ax.set_ylabel('dF/F', fontsize=9)
-    ax.set_title(f'Cell {cell_id} (resp={result["mean_response"]:.3f})',
-                fontsize=10, fontweight='bold')
-    ax.legend(fontsize=8, loc='upper right')
+    ax.set_xlabel('Position (cm)', fontsize=10)
+    ax.set_ylabel('Firing Rate (Hz)', fontsize=10)
+    ax.set_title(f'Place Cell {idx} Tuning Curve\nPeak: {cell.peak_rate:.1f} Hz',
+                fontsize=11, fontweight='bold')
+    ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
 
-plt.suptitle('Trial-Averaged Responses (Top 6 Responsive Cells)',
-            fontsize=14, fontweight='bold')
+plt.suptitle('Example Place Cell Tuning Curves', fontsize=14, fontweight='bold')
 plt.tight_layout()
-plt.savefig('calcium_trial_averaged.png', dpi=150, bbox_inches='tight')
+plt.savefig('tuning_curves.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 
-# Visualization 5: Summary statistics
-fig = plt.figure(figsize=(15, 10))
-gs = GridSpec(3, 3, figure=fig, hspace=0.35, wspace=0.35)
+# Population activity raster
+fig, axes = plt.subplots(3, 1, figsize=(15, 9))
 
-# 1. Responsive vs non-responsive counts
-ax1 = fig.add_subplot(gs[0, 0])
-counts = [sum(is_responsive), len(is_responsive) - sum(is_responsive)]
-colors = ['red', 'blue']
-ax1.bar(['Responsive', 'Non-responsive'], counts, color=colors, alpha=0.7, edgecolor='black')
-ax1.set_ylabel('Number of Cells', fontsize=10)
-ax1.set_title('Cell Classification', fontsize=11, fontweight='bold')
-ax1.grid(True, alpha=0.3, axis='y')
+time_window = slice(0, 300)  # 30 seconds
 
-for i, count in enumerate(counts):
-    ax1.text(i, count + 1, str(count), ha='center', fontsize=12, fontweight='bold')
+# Raster plot
+ax = axes[0]
+for cell_idx in range(n_cells):
+    spike_times = time[time_window][spike_counts[cell_idx, time_window] > 0]
+    ax.scatter(spike_times, [cell_idx] * len(spike_times),
+              s=2, c='black', alpha=0.5)
 
-# 2. Response amplitude distribution
-ax2 = fig.add_subplot(gs[0, 1])
-responsive_amplitudes = [r['mean_response'] for r in classification_results if r['is_responsive']]
-non_responsive_amplitudes = [r['mean_response'] for r in classification_results if not r['is_responsive']]
+ax.set_ylabel('Cell ID', fontsize=11)
+ax.set_title('Population Activity Raster', fontsize=12, fontweight='bold')
+ax.set_xlim(time[time_window][0], time[time_window][-1])
 
-ax2.hist(responsive_amplitudes, bins=15, color='red', alpha=0.6, label='Responsive')
-ax2.hist(non_responsive_amplitudes, bins=15, color='blue', alpha=0.6, label='Non-responsive')
-ax2.set_xlabel('Mean Response Amplitude', fontsize=10)
-ax2.set_ylabel('Count', fontsize=10)
-ax2.set_title('Response Amplitude Distribution', fontsize=11, fontweight='bold')
-ax2.legend(fontsize=9)
-ax2.grid(True, alpha=0.3, axis='y')
+# Firing rates heatmap
+ax = axes[1]
+im = ax.imshow(firing_rates[:, time_window], aspect='auto',
+              cmap='hot', interpolation='nearest',
+              extent=[time[time_window][0], time[time_window][-1], 
+                     n_cells, 0])
+ax.set_ylabel('Cell ID', fontsize=11)
+ax.set_title('Firing Rate Heatmap', fontsize=12, fontweight='bold')
+plt.colorbar(im, ax=ax, label='Firing Rate (Hz)')
 
-# 3. Reliability distribution
-ax3 = fig.add_subplot(gs[0, 2])
-responsive_reliability = [r['reliability'] for r in classification_results if r['is_responsive']]
-non_responsive_reliability = [r['reliability'] for r in classification_results if not r['is_responsive']]
+# Position
+ax = axes[2]
+ax.plot(time[time_window], true_position[time_window], 
+       'k-', linewidth=2)
+ax.set_xlabel('Time (s)', fontsize=11)
+ax.set_ylabel('Position (cm)', fontsize=11)
+ax.set_title('Animal Position', fontsize=12, fontweight='bold')
+ax.set_xlim(time[time_window][0], time[time_window][-1])
+ax.grid(True, alpha=0.3)
 
-ax3.hist(responsive_reliability, bins=15, color='red', alpha=0.6, label='Responsive')
-ax3.hist(non_responsive_reliability, bins=15, color='blue', alpha=0.6, label='Non-responsive')
-ax3.set_xlabel('Reliability', fontsize=10)
-ax3.set_ylabel('Count', fontsize=10)
-ax3.set_title('Reliability Distribution', fontsize=11, fontweight='bold')
-ax3.legend(fontsize=9)
-ax3.grid(True, alpha=0.3, axis='y')
-
-# 4. ROI size distribution
-ax4 = fig.add_subplot(gs[1, 0])
-roi_areas = [roi['area'] for roi in rois]
-ax4.hist(roi_areas, bins=20, color='purple', alpha=0.7, edgecolor='black')
-ax4.set_xlabel('ROI Area (pixels)', fontsize=10)
-ax4.set_ylabel('Count', fontsize=10)
-ax4.set_title('ROI Size Distribution', fontsize=11, fontweight='bold')
-ax4.grid(True, alpha=0.3, axis='y')
-
-# 5. Correlation: response vs p-value
-ax5 = fig.add_subplot(gs[1, 1])
-ax5.scatter(mean_responses, -np.log10(np.array(p_values) + 1e-10),
-           c=['red' if r else 'blue' for r in is_responsive],
-           alpha=0.6, s=50, edgecolors='black')
-ax5.axhline(y=-np.log10(0.05), color='red', linestyle='--', linewidth=2)
-ax5.set_xlabel('Mean Response Amplitude', fontsize=10)
-ax5.set_ylabel('-log10(p-value)', fontsize=10)
-ax5.set_title('Volcano Plot', fontsize=11, fontweight='bold')
-ax5.grid(True, alpha=0.3)
-
-# 6. SNR vs responsiveness
-ax6 = fig.add_subplot(gs[1, 2])
-snr = []
-for i in range(len(rois)):
-    signal = np.max(dff_traces[i])
-    noise = np.std(dff_traces[i])
-    snr.append(signal / noise if noise > 0 else 0)
-
-responsive_snr = [snr[i] for i in range(len(rois)) if is_responsive[i]]
-non_responsive_snr = [snr[i] for i in range(len(rois)) if not is_responsive[i]]
-
-ax6.boxplot([responsive_snr, non_responsive_snr],
-           labels=['Responsive', 'Non-responsive'],
-           patch_artist=True,
-           boxprops=dict(facecolor='lightgray', alpha=0.7))
-ax6.set_ylabel('SNR', fontsize=10)
-ax6.set_title('Signal-to-Noise Ratio', fontsize=11, fontweight='bold')
-ax6.grid(True, alpha=0.3, axis='y')
-
-# 7. Example neuropil correction
-ax7 = fig.add_subplot(gs[2, :])
-example_cell = 0
-time_window = slice(0, 300)
-
-ax7.plot(raw_traces[example_cell, time_window], 
-        label='Raw', color='gray', linewidth=1.5, alpha=0.7)
-ax7.plot(neuropil_traces[example_cell, time_window] * 0.7, 
-        label='Neuropil (×0.7)', color='orange', linewidth=1.5, alpha=0.7)
-ax7.plot(corrected_traces[example_cell, time_window], 
-        label='Corrected', color='blue', linewidth=1.5)
-
-for stim_frame in stim_frames:
-    if stim_frame < 300:
-        ax7.axvline(x=stim_frame, color='red', linestyle='--', alpha=0.3)
-
-ax7.set_xlabel('Frame', fontsize=10)
-ax7.set_ylabel('Fluorescence (a.u.)', fontsize=10)
-ax7.set_title(f'Neuropil Correction Example (Cell {example_cell})', 
-             fontsize=11, fontweight='bold')
-ax7.legend(fontsize=9, loc='upper right')
-ax7.grid(True, alpha=0.3)
-
-plt.suptitle('Calcium Imaging Analysis: Summary Statistics',
-            fontsize=14, fontweight='bold')
-plt.savefig('calcium_summary_statistics.png', dpi=150, bbox_inches='tight')
+plt.tight_layout()
+plt.savefig('population_activity.png', dpi=150, bbox_inches='tight')
 plt.show()
 
 
-#%% PART 8: FINAL SUMMARY
+# Posterior probability heatmap
+fig, ax = plt.subplots(figsize=(15, 6))
+
+time_window_short = slice(0, 100)  # 10 seconds
+im = ax.imshow(posteriors[:, time_window_short], aspect='auto',
+              cmap='viridis', interpolation='nearest',
+              extent=[time[time_window_short][0], time[time_window_short][-1],
+                     0, track_length],
+              origin='lower')
+
+ax.plot(time[time_window_short], true_position[time_window_short],
+       'r-', linewidth=3, label='True position', alpha=0.8)
+ax.plot(time[time_window_short], decoded_position_bayes[time_window_short],
+       'w--', linewidth=2, label='Decoded position', alpha=0.8)
+
+ax.set_xlabel('Time (s)', fontsize=12)
+ax.set_ylabel('Position (cm)', fontsize=12)
+ax.set_title('Bayesian Posterior Probability Over Time',
+            fontsize=13, fontweight='bold')
+ax.legend(fontsize=11, loc='upper right')
+plt.colorbar(im, ax=ax, label='Posterior Probability')
+
+plt.tight_layout()
+plt.savefig('posterior_probability.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+
+#%% PART 8: SUMMARY STATISTICS
 
 print("\n" + "="*70)
 print("ANALYSIS SUMMARY")
 print("="*70)
 
-print(f"\nDataset:")
-print(f"  Movie dimensions: {movie.shape}")
-print(f"  Duration: {movie.shape[0]/30:.1f} seconds (@ 30 Hz)")
-print(f"  Number of trials: {len(stim_frames)}")
+print(f"\nSimulation Parameters:")
+print(f"  Number of place cells: {n_cells}")
+print(f"  Track length: {track_length} cm")
+print(f"  Duration: {duration} s")
+print(f"  Time bins: {len(time)}")
+print(f"  Bin size: {dt} s")
 
-print(f"\nROI Detection:")
-print(f"  Total ROIs detected: {len(rois)}")
-print(f"  Mean ROI area: {np.mean([roi['area'] for roi in rois]):.1f} pixels")
-print(f"  ROI area range: [{min([roi['area'] for roi in rois])}, {max([roi['area'] for roi in rois])}]")
+print(f"\nPlace Cell Properties:")
+centers = [cell.center for cell in place_cells]
+widths = [cell.width for cell in place_cells]
+peak_rates = [cell.peak_rate for cell in place_cells]
+print(f"  Field centers: {min(centers):.1f} - {max(centers):.1f} cm")
+print(f"  Mean field width: {np.mean(widths):.1f} ± {np.std(widths):.1f} cm")
+print(f"  Mean peak rate: {np.mean(peak_rates):.1f} ± {np.std(peak_rates):.1f} Hz")
 
-print(f"\nStimulus Response:")
-n_resp = sum(is_responsive)
-print(f"  Responsive cells: {n_resp}/{len(rois)} ({100*n_resp/len(rois):.1f}%)")
-print(f"  Non-responsive cells: {len(rois)-n_resp}/{len(rois)}")
+print(f"\nDecoding Performance:")
+print(f"\n  Bayesian Decoder:")
+print(f"    Mean error: {np.mean(decoding_error_bayes):.2f} cm")
+print(f"    Median error: {np.median(decoding_error_bayes):.2f} cm")
+print(f"    95th percentile: {np.percentile(decoding_error_bayes, 95):.2f} cm")
 
-if responsive_amplitudes:
-    print(f"\nResponsive Cell Properties:")
-    print(f"  Mean response amplitude: {np.mean(responsive_amplitudes):.3f} ± {np.std(responsive_amplitudes):.3f}")
-    print(f"  Mean reliability: {np.mean(responsive_reliability):.3f} ± {np.std(responsive_reliability):.3f}")
+print(f"\n  Population Vector:")
+print(f"    Mean error: {np.mean(decoding_error_pv):.2f} cm")
+print(f"    Median error: {np.median(decoding_error_pv):.2f} cm")
+print(f"    95th percentile: {np.percentile(decoding_error_pv, 95):.2f} cm")
 
-print(f"\nStatistical Testing:")
-print(f"  Permutations: 1,000 per cell")
-print(f"  Significance threshold: α = 0.05")
-print(f"  Median p-value (responsive): {np.median([r['p_value'] for r in classification_results if r['is_responsive']]):.4f}")
-print(f"  Median p-value (non-responsive): {np.median([r['p_value'] for r in classification_results if not r['is_responsive']]):.4f}")
+improvement = (np.mean(decoding_error_pv) - np.mean(decoding_error_bayes)) / np.mean(decoding_error_pv) * 100
+print(f"\n  Bayesian improvement: {improvement:.1f}%")
+
+print(f"\nPopulation Size Analysis:")
+print(f"  Tested: {population_size_results['n_cells'][0]} - {population_size_results['n_cells'][-1]} cells")
+print(f"  Error reduction (5→30 cells):")
+print(f"    Bayesian: {population_size_results['bayes_error_mean'][0]:.2f} → {population_size_results['bayes_error_mean'][-1]:.2f} cm")
+print(f"    Pop. Vector: {population_size_results['pv_error_mean'][0]:.2f} → {population_size_results['pv_error_mean'][-1]:.2f} cm")
+
+print(f"\nNoise Robustness:")
+print(f"  Noise levels tested: {noise_results['noise_levels'][0]:.1f} - {noise_results['noise_levels'][-1]:.1f} σ")
+print(f"  Bayesian error increase: {noise_results['bayes_error'][0]:.2f} → {noise_results['bayes_error'][-1]:.2f} cm")
+print(f"  Pop. Vector error increase: {noise_results['pv_error'][0]:.2f} → {noise_results['pv_error'][-1]:.2f} cm")
 
 print("\n" + "="*70)
 print("ALL ANALYSES COMPLETE")
 print("="*70)
 print("\nGenerated files:")
-print("  - calcium_roi_maps.png")
-print("  - calcium_example_traces.png")
-print("  - calcium_response_analysis.png")
-print("  - calcium_trial_averaged.png")
-print("  - calcium_summary_statistics.png")
+print("  - decoder_position_comparison.png")
+print("  - decoder_population_size.png")
+print("  - decoder_noise_comparison.png")
+print("  - tuning_curves.png")
+print("  - population_activity.png")
+print("  - posterior_probability.png")
