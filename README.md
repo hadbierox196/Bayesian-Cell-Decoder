@@ -503,29 +503,7 @@ ALL ANALYSES COMPLETE
    - Result: Bayesian offers richer information
 
 ---
-
-## Project Structure
-
-```
-bayesian-place-cell-decoder/
-│
-├── bayesian_place_cell_decoder.py    # Main analysis script
-├── requirements.txt                   # Python dependencies
-├── README.md                          # This file
-├── LICENSE                            # MIT License
-│
-├── outputs/                           # Generated figures (created on run)
-│   ├── decoder_position_comparison.png
-│   ├── decoder_population_size.png
-│   ├── decoder_noise_comparison.png
-│   ├── tuning_curves.png
-│   ├── population_activity.png
-│   └── posterior_probability.png
-│
-└── docs/                              # Additional documentation
-    ├── THEORY.md                      # Mathematical theory
-    ├── METHODS.md                     # Detailed methods
-    └── APPLICATIONS.md                # Real-world applications
+IONS.md                # Real-world applications
 ```
 
 ---
